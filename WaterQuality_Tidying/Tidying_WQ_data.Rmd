@@ -1,0 +1,469 @@
+---
+title: "Tidying Public Ecological Data"
+author: "Matthew Ross"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  
+  html_document:
+    toc:  yes
+    toc_depth:  3
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+# Why public datasets?
+
+Working with large, open-access datasets can serve many purposes. It can be an excellent way to explore new ideas, before investing in field-work or experiments. It can be a great way to take local or experimental results and expand them to different ecosystems, places, or landscapes. Or it can be an excellent way to build, validate, and test ecological models on regional or national scales. 
+
+So why doesn't everyone use public data? Well, it's often collected by a variety of organizations, with different methods, units, and incosistent metadata. Together these issues with large public datasets, make them "messy." Messy data can be messy in many different ways, but at the basic level it means that data is hard to analyze, not because the data itself is bad, but because the way it is organized is unclear or inconsistent. 
+
+In this lab, we will learn some tricks to "tidying" data, making it analysis-ready. We will depend heavily on the [tidyverse](https://www.tidyverse.org/), an excellent series of packages that make data manipulation beautiful and easy. We will also be working with water quality portal data so we will also use the excellent [dataRetrieval](https://github.com/USGS-R/dataRetrieval) package for downloading data from the Water Quality Portal and the USGS. 
+
+## Loading key packages
+
+This lab is meant to introduce the incredible variety of tools that one can use to clean data, many of these tools are captured by the `tidyverse` meta-package, a package of packages, but there are some additional ones that will help us locate our various water quality sites. 
+
+
+```{r setup, warnings='hide',message=FALSE}
+library(tidyverse) # Package with dplyr, tibble, readr, and others to help clean coding
+library(dataRetrieval) # Package to download data. 
+library(sf) #Geospatial package to plot and explore data
+library(mapview) #Simple interface to leaflet interactive maps
+library(broom) #Simplifies model outputs
+library(knitr) #Makes nice tables
+library(kableExtra) #Makes even nicer tables
+library(lubridate) #Makes working with dates easier
+library(ggthemes) #Makes plots prettier
+library(tidyr) #Makes multiple simultaneous models easier
+
+
+#Move the directory to the top folder level
+knitr::opts_knit$set(root.dir='..')
+
+```
+
+# Downloading data.
+
+For this lab, we'll explore water quality data in the Colorado River basin as it moves from Colorado to Arizona. All data will be generated through the code you see below, with the only external information coming from knowing the SiteID's for the monitoring locations along the Colorado River and the water quality characteristic names. 
+
+
+The water quality portal can be accessed with the command `readWQPdata`, which takes a variety of parameters (like startdate, enddate, constituents, etc...). We'll generate these rules for downloading the data here. 
+
+## Download prep
+
+```{r download prep}
+#First we'll make a tibble (a tidyverse table) with Site IDs. Generally these are increasingly downstream of the CO headwaters near Grand Lake. 
+colorado <- tibble(sites=c('USGS-09034500','USGS-09069000','USGS-09071100',
+                           'USGS-09085000','USGS-09095500','USGS-09152500',
+                           'USGS-09180000','USGS-09180500','USGS-09380000'),
+                   basin=c('colorado1','eagle','colorado2',
+                           'roaring','colorado3','gunnison',
+                           'dolores','colorado4','colorado5'))
+
+#Now we need to setup a series of rules for downloading data from the Water Quality Portal. 
+#We'll focus on cation and anion data from 1950-present. Each cation has a name that we might typically use like calcium or sulfate, but the name may be different in the water quality portal, so we have to check this website https://www.waterqualitydata.us/Codes/Characteristicname?mimeType=xml to get our names correct. 
+
+paramater.names <- c('ca','mg','na','k','so4','cl','hco3')
+
+ca <- c('Calcium')
+mg <- c('Magnesium')
+na <- 'Sodium'
+k <- 'Potassium'
+so4 <- c('Sulfate','Sulfate as SO4','Sulfur Sulfate','Total Sulfate')
+cl <- 'Chloride'
+hco3 <- c('Alkalinity, bicarbonate','Bicarbonate')
+
+#Compile all these names into a single list
+parameters <- list(ca,mg,na,k,so4,cl,hco3)
+#Name each cation or anion in the list
+names(parameters) <- paramater.names
+#Notice that we aren't downloading any nutrients (P or N) because they are much messier (100s of different ways to measure and report concentration data) than other cation anion data. 
+
+#Start dates
+start <- '1950-10-01'
+end <- '2018-09-30'
+
+#Sample media (no sediment samples)
+sampleMedia = 'Water'
+
+#Comple all this information into a list with arguments
+site.args <- list(siteid=colorado$sites,
+                  sampleMedia=sampleMedia,
+                  startDateLo=start,
+                  startDateHi=end,
+                  characteristicName=NA) #We'll fill this in later in a loop
+
+
+
+```
+
+## Concentration data download
+
+Now that we have generated the commands to download the data, the code to download the data is here, but it is not run on purpose because it takes 15 minutes or so to run everytime. You can always run it yourself by setting `eval=T`. 
+
+
+```{r concentration download, eval=F}
+conc.list <- list() #Empty list to hold each data download
+
+
+#We'll loop over each anion or cation and download all data at our sites for that constituent
+for(i in 1:length(parameters)){
+  #We need to rename the characteristicName (constituent) each time we go through the loop
+  site.args$characteristicName<-parameters[[i]]
+  
+  #readWQPdata takes in our site.args list and downloads the data according to those rules 
+  # time, constituent, site, etc...
+  
+  # Don't forget about pipes "%>%"! Pipes pass forward the results of a previous command, so that 
+  #You don't have to constantly rename variables. I love them. 
+  
+  conc.list[[i]] <- readWQPdata(site.args) %>%
+    mutate(parameter=names(parameters)[i]) #Mutate just adds a new column to the data frame
+  
+  #Pipes make the above command simple and succinct versus something more complicated like:
+  
+  ## conc.list[[i]] <- readWQPdata(site.args) 
+  ## conc.list[[i]]$parameter <- names(parameters)[i]
+}
+
+#bind all this data together into a single data frame
+conc.long <- map_dfr(conc.list,rbind)
+
+
+```
+
+## Site info download
+
+We also need to download some site info so we can know where these sites are. 
+```{r site info download, eval=F}
+#In addition to concentration informatino, we probably want to know some things about the sites
+#dplyr::select can help us only keep site information that is useful. 
+
+site.info <- whatWQPsites(siteid=colorado$sites) %>%
+  dplyr::select(SiteID=MonitoringLocationIdentifier,
+                  name=MonitoringLocationName,
+                  area=DrainageAreaMeasure.MeasureValue,
+                  area.units=DrainageAreaMeasure.MeasureUnitCode,
+                  lat=LatitudeMeasure,
+                  long=LongitudeMeasure) %>%
+  distinct() #Distinct just keeps the first of any duplicates. 
+
+#The above function and map are equivalent to something more like this: 
+  # site.list <- list()
+  # for(i in 1:length(colorado$sites)){
+  #   site.list[[i]] <- whatWQPsites(siteid=colorado$sites[i]) %>%
+  #       dplyr::select(SiteID=MonitoringLocationIdentifier,
+  #                   name=MonitoringLocationName,
+  #                   area=DrainageAreaMeasure.MeasureValue,
+  #                   area.units=DrainageAreaMeasure.MeasureUnitCode,
+  #                   lat=LatitudeMeasure,
+  #                   long=LongitudeMeasure)
+  # }
+  # 
+  # site.info <- do.call(site.list,'rbind')
+
+```
+
+## Data save
+
+Save the data so we don't have to rerun all the above code. 
+```{r save downloads,eval=F}
+#So that we don't have to download that data everytime
+save(site.info,conc.long,file='WaterQuality_Tidying/wqp_co_data.RData')
+
+```
+
+## Data Load
+
+```{r data readin}
+load('WaterQuality_Tidying/wqp_co_data.RData')
+
+```
+
+
+# Data tidying
+
+Now that we have downloaded the data we need to tidy it up. The water quality portal data comes with an incredible amount of metadata in the form of extra columns. But we don't need all this extra data. 
+## Look at the data you downloaded.
+
+There are two data types we downloaded. First site info which has things like lat and long, and second concentration data. We already slightly tidied the site info data so that it has sensible column names 
+
+```{r site info}
+
+head(site.info)
+```
+
+This dataset looks nice because it has all the information we need and nothing extra. Now let's look at the concentration data. 
+
+```{r conc data}
+head(conc.long) %>%
+  kable(.,'html') %>%
+  kable_styling() %>%
+  scroll_box(width='800px',height='300px')
+  
+```
+
+
+## Initial cleaning up
+
+Wow that looks messy! Lots of extraneous columns, lots of NAs, so much information we can hardly parse it. Let's pair it down to the essentials. 
+
+```{r tidying up concentration}
+#This code mostly just grabs and renames the most important data columns
+conc.clean <-  conc.long %>%
+                  dplyr::select(date=ActivityStartDate,
+                         parameter=CharacteristicName,
+                         units=ResultMeasure.MeasureUnitCode,
+                         SiteID=MonitoringLocationIdentifier,
+                         org=OrganizationFormalName,
+                         org_id=OrganizationIdentifier,
+                         time=ActivityStartTime.Time,
+                         value=ResultMeasureValue,
+                         sample_method=SampleCollectionMethod.MethodName,
+                         analytical_method=ResultAnalyticalMethod.MethodName,
+                         particle_size=ResultParticleSizeBasisText,
+                         date_time=ActivityStartDateTime,
+                         media=ActivityMediaName,
+                         sample_depth=ActivityDepthHeightMeasure.MeasureValue,
+                         sample_depth_unit=ActivityDepthHeightMeasure.MeasureUnitCode,
+                         fraction=ResultSampleFractionText,
+                         status=ResultStatusIdentifier) %>%
+  #Remove trailing white space in labels
+  mutate(units = trimws(units)) %>%
+  #Keep only samples that are water samples
+  filter(media=='Water') #Some of these snuck through!
+
+```
+
+Now let's look at the tidier version 
+```{r examine tidier data}
+head(conc.long) %>%
+  kable(.,'html') %>%
+  kable_styling() %>%
+  scroll_box(width='800px',height='300px')
+```
+
+## Final tidy dataset
+
+Okay that is getting better but we still have lots of extraneous information. For our purposes let's assume that the sample and analytical methods used by the USGS are reasonable and exchangeable (one method is equivalent to the other). If we make that assumption then the only remaining data we need to clean is to make sure that all the data has the same units. 
+
+### Unit Check
+
+```{r unit check}
+table(conc.clean$units)
+```
+
+Wow! Almost all the data is in mg/L. That makes our job really easy. 
+
+We just need to remove these observations with a `dplyr::filter` call and then select an even smaller subset of useful columns, while adding a time object column using the `lubridate::ymd` call. 
+
+```{r tidy}
+conc.tidy <- conc.clean %>% 
+  filter(units != 'tons/day') %>%
+  mutate(date=ymd(date)) %>%
+  select(date,
+         parameter,
+         SiteID,
+         conc=value)
+
+
+```
+
+### Daily data
+
+Okay now we have a manageable data frame. But how do we want to organize the data? Since we are looking at a really long time-series of data (70 years), let's look at data as a daily average. The `dplyr::group_by and summarize` commands make this really easy
+
+```{r daily}
+
+
+#The amazing group_by function groups all the data so that the summary
+#only applies to each subgroup (site, date, and parameter combination).
+#So in the end you get a daily average concentratino for each site and parameter type. 
+conc.daily <- conc.tidy %>%
+  group_by(date,parameter,SiteID) %>% 
+  summarize(conc=mean(conc,na.rm=T))
+
+```
+
+Taking daily averages looks like it did eliminate `r nrow(conc.tidy) - nrow(conc.daily)` observations, meaning these site date combinations had multiple observations on the same day. 
+
+
+# Analyzing data
+
+Now we have a 'tidy' dataset. Let's look at the data we have. First where is the data? 
+
+### Map
+
+Here we use the `sf` package to project the site information data into a GIS type data object called a `simple feature (sf)`. The function `st_as_sf` converts the long (x) and lat (y) coordinates into a projected point feature with the EPSG code 4326 (WGS 84). We can then use the `mapview` package and function to look at where these sites are. 
+
+```{r}
+#convert site info as an sf object
+site.sf <- site.info %>%
+  st_as_sf(.,coords=c('long','lat'), crs=4326)
+
+
+mapview(site.sf)
+
+```
+
+So these sites are generally in the Colorado River Basin with increasing size. 
+
+## Concentration data
+
+Now that we know where the data is coming from let's look at the actual data we downloaded using ggplot2 
+
+
+### Calcium only
+
+To keep the plots simple at first let's look at calcium data by site. 
+
+```{r daily plot}
+conc.daily %>%
+  filter(parameter == 'Calcium') %>%
+  ggplot(.,aes(x=date,y=conc)) + 
+  geom_point() + 
+  facet_wrap(~SiteID)
+  
+```
+
+Okay that's a lot of data! Maybe too much. Let's focus in on sites with only continuous datasets and then summarize the data by year
+
+### Annual summaries of full sites
+
+Let's shrink the dataset to only look at annual change. 
+```{r annual only}
+too.few.years <- c('USGS-09034500','USGS-0907110','USGS-0908500')
+
+conc.annual <- conc.daily %>%
+  filter(!SiteID %in% too.few.years) %>% #! means opposite of, so we want all the sites not in the too.few years vector. 
+  mutate(year=year(date)) %>%
+  group_by(SiteID,year,parameter) %>%
+  summarize(annual_mean=mean(conc,na.rm=T),
+            annual_var=var(conc,na.rm=T))
+  
+
+```
+
+### Plot of all the annual data.
+
+```{r ugly}
+conc.annual %>%
+  ggplot(.,aes(x=year,y=annual_mean,color=SiteID)) + 
+  geom_point() + 
+  facet_wrap(~parameter,scales='free')
+```
+
+That plot is... ugly! Maybe we can make something prettier
+
+
+### Prettier annual plot. 
+
+Having the points colored by SiteID is not super useful, unless you have memorized the name and location of USGS gauge data. So maybe we can color it by the table we used to download the data? That table `colorado` was organized such that each basin had it's own name or was increasing in basin size. That's a better way to think about the data than as SiteID names. So let's use `join` functions to join the datasets and use the basin names. We'll also use the package `ggthemes` to try and make the plots prettier. 
+
+
+```{r pretty,fig.width=9,fig.height=7}
+conc.annual %>%
+  left_join(colorado %>%
+              rename(SiteID=sites),by='SiteID') %>%
+  ggplot(.,aes(x=year,y=annual_mean,color=basin)) + 
+  geom_point() + 
+  facet_wrap(~parameter,scales='free') + 
+  theme_few() + 
+  scale_color_few() + 
+  theme(legend.position=c(.7,.15)) + 
+  guides(color=guide_legend(ncol=2))
+
+```
+
+### Watershed size
+
+Many prior publications have shown that increasing watershed size means decreasing variance in anion and cation concentrations. We can use our dataset to test this in the colorado basin. 
+
+```{r}
+conc.annual %>%
+  left_join(site.info,by='SiteID') %>%
+  filter(annual_var < 5000) %>%
+  ggplot(.,aes(x=year,y=annual_var,color=area)) + 
+  geom_point() + 
+  facet_wrap(~parameter,scales='free') + 
+  theme_few() + 
+  theme(legend.position=c(.7,.15)) 
+```
+
+Cool! Looks like it's generally true across all constituents. Potassium has low variance. Why? No clue!
+
+## Reshaping the data
+
+From basic weathering geochemistry principles we know that Bicarbonate concentrations should be correlated with Mg and Ca depending on the weathering reactions that generate these river signals. The current shape of the data in a 'long' format makes looking at these correlations impossible. So we want to 'widen' the data so the parameters are arranged in side by side columns. This is really easy with tidyr `spread` and `gather`!
+
+```{r}
+head(conc.annual)
+conc.wide <- conc.annual %>%
+  select(-annual_var) %>%
+  spread(key=parameter,value=annual_mean) %>%
+  mutate(`Mg+Ca`=Magnesium+Calcium)
+
+
+ggplot(conc.wide,aes(x=Bicarbonate,y=`Mg+Ca`,color=SiteID)) + 
+  geom_point() + 
+  geom_abline(slope=1,intercept=0)
+
+
+```
+
+
+## Model changes
+
+It looks to me like there might be some trends in the data at certain sites. (Mg and SO4 in particular). Let's use some advanced r to check if there are some linear trends in these datasets. 
+
+
+### Nesting and modelling
+
+There is a really excellent package called purrr and tidyr make doing multiple models on different sites really easy. Quick example here
+
+
+```{r}
+
+conc.nest <- conc.annual %>%
+  group_by(parameter,SiteID) %>%
+  nest() 
+
+head(conc.nest)
+```
+
+That nests or wraps up the data into tidy little bundles. We can access these bundled datasets by using a map function that applies a model *inside* a bundle. 
+```{r}
+#Create a generic model function (mean as afunction of time)
+time.lm.models <- function(x){
+  mod <- lm(annual_mean~year,data=x)
+}
+
+conc.models <- conc.nest %>%
+  mutate(mods=map(data,time.lm.models))
+
+head(conc.models)
+
+```
+
+Now we have an individual time-series analysis model for each site and parameter combination. But how do we see the results in a tidy way? Broom to the rescue!
+
+```{r}
+conc.models %>%
+  mutate(mod.glance=map(mods,glance)) %>%
+  unnest(mod.glance) %>% #Unnesting unwraps the nested column. 
+  arrange(desc(adj.r.squared)) %>%
+  select(parameter,SiteID,adj.r.squared,p.value,logLik,AIC) %>%
+  kable(.,'html') %>%
+  kable_styling() %>%
+  scroll_box(width='600px',height='500px')
+
+
+```
+
+
+Cool! Lots of these constituents have significant trends. Many of them are declining, why? what does that mean for water quality? I don't know. But we could probably use more public data to investigate. 
+
+# Fin
